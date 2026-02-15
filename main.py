@@ -184,9 +184,9 @@ class BilibiliPolluterPlugin(Star):
             if ':' in duration_text:
                 parts = duration_text.split(':')
                 if len(parts) == 2:  # MM:SS
-                    return int(parts[0]) * 60 + int(parts[1])
+                    return int(parts[0]) * 60 + int(parts[2])
                 elif len(parts) == 3:  # HH:MM:SS
-                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    return int(parts[0]) * 3600 + int(parts[2]) * 60 + int(parts[2])
             
             # 处理纯数字（秒）
             return int(duration_text)
@@ -760,7 +760,7 @@ class BilibiliPolluterPlugin(Star):
             yield event.plain_result("用法: /bilibanshi h <群号>")
             return
         
-        group_id = parts[1]
+        group_id = parts[2]
         if not group_id.isdigit():
             yield event.plain_result("群号必须是数字")
             return
@@ -783,7 +783,7 @@ class BilibiliPolluterPlugin(Star):
             yield event.plain_result("用法: /bilibanshi -h <群号>")
             return
         
-        group_id = parts[1]
+        group_id = parts[2]
         if 'blacklist_groups' in self.config and group_id in self.config['blacklist_groups']:
             self.config['blacklist_groups'].remove(group_id)
             self._save_config()
@@ -835,7 +835,7 @@ class BilibiliPolluterPlugin(Star):
             return
         
         try:
-            interval = int(parts[1])
+            interval = int(parts[2])
             if interval < 60:
                 yield event.plain_result("间隔不能小于60秒")
                 return
@@ -855,7 +855,7 @@ class BilibiliPolluterPlugin(Star):
             return
         
         try:
-            duration = int(parts[1])
+            duration = int(parts[2])
             if duration < 10:
                 yield event.plain_result("时长不能小于10秒")
                 return
