@@ -16,7 +16,7 @@
 
 /bilibanshi list 查看当前状态
 /bilibanshi interval <秒> 设置搬石间隔（如 3600）
-/bilibanshi maxduration <秒> 设置视频最大时长（默认600秒/10分钟）
+/bilibanshi maxduration <秒> 设置视频最大时长（默认60秒/1分钟）
 
 ### 关键词管理
 
