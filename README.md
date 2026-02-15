@@ -1,0 +1,2 @@
+# astrbot_plugin_bilibanshi
+让你的bot可以搬石
