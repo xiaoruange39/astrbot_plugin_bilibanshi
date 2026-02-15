@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.message_components import *
@@ -623,15 +623,16 @@ class BilibiliPolluterPlugin(Star):
                 continue
             
             try:
-                # 构建消息链
+                # 构建消息链（列表形式）
                 chain = [Plain(text_msg)]
                 
                 if file_exists:
                     video = Video.fromFileSystem(path=file_path)
                     chain.append(video)
                 
-                # 使用存储的 unified_msg_origin 发送
-                await self.context.send_message(umo, chain)
+                # 转换成 MessageChain 再发送
+                message_chain = MessageChain(chain)
+                await self.context.send_message(umo, message_chain)
                 logger.info(f"已发送到群 {group_id}")
                 
                 # 群之间延迟
@@ -691,14 +692,17 @@ class BilibiliPolluterPlugin(Star):
                 yield event.plain_result("❌ 下载失败")
 
     async def _timer_task(self):
+        """定时任务（1分钟一次）"""
         while self.running:
             try:
+                # 定时任务不传 event，会发送到所有已绑定的群
+                # 注意：这里要用 async for 遍历，不能用 await
                 async for _ in self._scan_and_download():
-                    pass  
+                    pass  # 定时任务不需要处理返回值
             except Exception as e:
                 logger.error(f"定时任务异常: {e}")
-        
-            await asyncio.sleep(self.config['scan_interval'])
+            
+            await asyncio.sleep(self.config['scan_interval'])  # 默认60秒
 
     # ==================== 指令区 ====================
 
