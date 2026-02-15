@@ -1,0 +1,6 @@
+name: astrbot_plugin_bilibanshi 
+display_name: bilibili搬石
+desc: 让bot在bilibili搬石
+version: v1.0.0 
+author: Xuewu 
+repo: https://github.com/Xuewu-awa/astrbot_plugin_bilibanshi
