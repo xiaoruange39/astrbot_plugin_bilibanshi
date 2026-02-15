@@ -5,18 +5,22 @@ import json
 import os
 import subprocess
 import uuid
-import time
-import requests
+import aiohttp
+import aiofiles
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import quote
+from asyncio import Semaphore
+import shutil
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.message_components import *
+from astrbot.api import star
 
-@register("astrbot_plugin_bilibili_polluter", "Xuewu", "B站搬石 - 随机搬视频到群", "1.0.0")
+
+@register("astrbot_plugin_bilibili_polluter", "Xuewu", "B站搬石 - 随机搬视频到群", "1.1.0")
 class BilibiliPolluterPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -26,12 +30,37 @@ class BilibiliPolluterPlugin(Star):
             "咕咕嘎嘎", "凑企鹅", "没人看懂", "旮旯给木", "搬石", "高松灯"
         ]
         
+        # 数据目录（使用框架规范路径）
+        self.data_dir = Path(context.get_data_dir())
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 配置路径
+        self.config_path = self.data_dir / "config.json"
+        
+        # 下载目录
+        self.download_dir = self.data_dir / "downloads"
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 加载配置
         self.config = self._load_config()
+        
+        # 运行状态
         self.running = False
         self.task: Optional[asyncio.Task] = None
-        self.temp_files = []
         
-        # 请求头（用于搜索）
+        # 临时文件追踪（使用Set避免重复）
+        self.temp_files: Set[str] = set()
+        
+        # 配置锁（防止并发写入）
+        self.config_lock = asyncio.Lock()
+        
+        # 并发控制信号量（最大5个并发请求）
+        self.semaphore = Semaphore(5)
+        
+        # 共享的HTTP会话（aiohttp）
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+        # 请求头
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.bilibili.com/',
@@ -44,10 +73,18 @@ class BilibiliPolluterPlugin(Star):
         if not self.ffmpeg_available:
             logger.warning("FFmpeg未安装，视频合并功能将不可用")
         
-        logger.info(f"B站搬石已加载，下载目录: {self.config['download_dir']}")
+        logger.info(f"B站搬石已加载，下载目录: {self.download_dir}")
 
     async def initialize(self):
-        """插件初始化 - 开机自启动"""
+        """插件初始化 - 创建会话和启动定时任务"""
+        # 创建共享的aiohttp会话
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+        self.session = aiohttp.ClientSession(
+            headers=self.headers,
+            timeout=timeout
+        )
+        
+        # 开机自启动
         if self.config.get('auto_start', True):
             self.running = True
             self.task = asyncio.create_task(self._timer_task())
@@ -60,21 +97,23 @@ class BilibiliPolluterPlugin(Star):
             self.task.cancel()
             try:
                 await self.task
-            except:
-                pass
+            except asyncio.CancelledError:
+                logger.info("定时任务已取消")
+            except Exception as e:
+                logger.error(f"定时任务停止时出错: {e}")
             self.task = None
         
-        # 清理临时文件
-        self._cleanup_temp_files()
-
-    def _load_config(self) -> Dict:
-        """加载配置"""
-        config_path = Path("data") / "plugins" / "bilibili_polluter" / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        # 关闭HTTP会话
+        if self.session and not self.session.closed:
+            await self.session.close()
         
+        # 清理临时文件
+        await self._cleanup_temp_files()
+
+    def _load_config(self) -> Dict[str, Any]:
+        """加载配置"""
         default_config = {
             "auto_start": True,
-            "download_dir": str(Path("data") / "plugins" / "bilibili_polluter" / "downloads"),
             "scan_interval": 60,              # 1分钟扫一次
             "blacklist_groups": [],           # 黑名单群
             "bound_groups": {},                # 已绑定的群 {group_id: unified_msg_origin}
@@ -84,36 +123,43 @@ class BilibiliPolluterPlugin(Star):
             "max_duration": 600,               # 最大时长（秒），默认10分钟=600秒
         }
         
-        if config_path.exists():
+        if self.config_path.exists():
             try:
-                with open(config_path, 'r', encoding='utf-8') as f:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
                     saved_config = json.load(f)
                     default_config.update(saved_config)
             except Exception as e:
                 logger.error(f"读取配置文件失败: {e}")
         
-        Path(default_config["download_dir"]).mkdir(parents=True, exist_ok=True)
-        
         return default_config
 
-    def _save_config(self):
-        """保存配置"""
-        config_path = Path("data") / "plugins" / "bilibili_polluter" / "config.json"
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存配置文件失败: {e}")
+    async def _save_config(self):
+        """异步保存配置（带锁）"""
+        async with self.config_lock:
+            try:
+                # 先写入临时文件，再重命名，避免写入损坏
+                temp_path = self.config_path.with_suffix('.tmp')
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.config, f, ensure_ascii=False, indent=2)
+                # Windows需要先删除目标文件
+                if self.config_path.exists():
+                    self.config_path.unlink()
+                temp_path.rename(self.config_path)
+            except Exception as e:
+                logger.error(f"保存配置文件失败: {e}")
 
-    def _cleanup_temp_files(self):
+    async def _cleanup_temp_files(self):
         """清理临时文件"""
-        for file_path in self.temp_files:
+        files_to_remove = list(self.temp_files)
+        self.temp_files.clear()
+        
+        for file_path in files_to_remove:
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
-            except:
-                pass
-        self.temp_files.clear()
+                    logger.debug(f"已删除临时文件: {file_path}")
+            except Exception as e:
+                logger.error(f"删除临时文件失败 {file_path}: {e}")
 
     def _check_ffmpeg(self) -> bool:
         """检查ffmpeg是否可用"""
@@ -128,25 +174,27 @@ class BilibiliPolluterPlugin(Star):
         if not filename:
             return "untitled"
         
+        # 提取书名号中的内容
         if '《' in filename and '》' in filename:
             title_match = re.search(r'《([^《》]+)》', filename)
             if title_match:
                 filename = title_match.group(1)
         
+        # 移除非法字符
         cleaned = re.sub(r'[<>:"/\\|?*]', '', filename)
         
+        # 限制长度
         if len(cleaned) > 100:
             cleaned = cleaned[:100]
         
         return cleaned.strip()
 
-    # ==================== 懒人模式：自动记录群 ====================
+    # ==================== 自动记录群 ====================
     
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         """自动记录群 unified_msg_origin（懒人模式）"""
         try:
-            # 获取 unified_msg_origin 和群号
             umo = event.unified_msg_origin
             group_id = str(event.message_obj.group_id)
             
@@ -160,21 +208,21 @@ class BilibiliPolluterPlugin(Star):
             # 如果是新群，自动记录
             if group_id not in self.config['bound_groups']:
                 self.config['bound_groups'][group_id] = umo
-                self._save_config()
-                logger.info(f"✅ 自动记录新群: {group_id}, umo: {umo}")
+                await self._save_config()
+                logger.info(f"✅ 自动记录新群: {group_id}")
                 
         except Exception as e:
             logger.error(f"自动记录群失败: {e}")
 
     # ==================== 搜索部分 ====================
 
-    def _parse_play_count(self, play_text) -> int:
+    def _parse_play_count(self, play_text: Any) -> int:
         """将播放量文本转换为数字"""
         if not play_text:
             return 0
         
-        if isinstance(play_text, int):
-            return play_text
+        if isinstance(play_text, (int, float)):
+            return int(play_text)
         
         play_text = str(play_text).strip()
         
@@ -187,18 +235,15 @@ class BilibiliPolluterPlugin(Star):
             unit_multiplier = 100000000
         
         try:
-            if '.' in play_text:
-                return int(float(play_text) * unit_multiplier)
-            else:
-                play_text = play_text.replace(',', '')
-                numbers = re.findall(r'\d+\.?\d*', play_text)
-                if numbers:
-                    return int(float(numbers[0]) * unit_multiplier)
-                return 0
+            # 提取数字部分
+            numbers = re.findall(r'\d+\.?\d*', play_text)
+            if numbers:
+                return int(float(numbers[0]) * unit_multiplier)
+            return 0
         except:
             return 0
 
-    def _parse_duration(self, duration_text) -> int:
+    def _parse_duration(self, duration_text: Any) -> int:
         """将时长文本转换为秒数"""
         if not duration_text:
             return 0
@@ -231,28 +276,28 @@ class BilibiliPolluterPlugin(Star):
         
         return False
 
-    async def _search_videos_by_keyword(self, keyword: str, max_pages: int = 3) -> List[Dict]:
+    async def _search_videos_by_keyword(self, keyword: str, max_pages: int = 3) -> List[Dict[str, Any]]:
         """使用指定关键词搜索视频，返回符合时长要求的视频列表"""
+        if not self.session:
+            logger.error("HTTP会话未初始化")
+            return []
+        
         videos = []
-        max_duration = self.config.get('max_duration', 600)  # 默认10分钟
+        max_duration = self.config.get('max_duration', 600)
         
         logger.info(f"搜索关键词: {keyword}, 最大时长: {max_duration}秒")
         
         for page in range(1, max_pages + 1):
             try:
-                # B站搜索API
-                api_url = f"https://api.bilibili.com/x/web-interface/search/all/v2?keyword={quote(keyword)}&page={page}"
-                
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: requests.get(api_url, headers=self.headers, timeout=10)
-                )
-                
-                if response.status_code != 200:
-                    continue
-                
-                data = response.json()
+                # 使用信号量控制并发
+                async with self.semaphore:
+                    api_url = f"https://api.bilibili.com/x/web-interface/search/all/v2?keyword={quote(keyword)}&page={page}"
+                    
+                    async with self.session.get(api_url) as response:
+                        if response.status != 200:
+                            continue
+                        
+                        data = await response.json()
                 
                 if data.get('code') != 0:
                     continue
@@ -316,12 +361,16 @@ class BilibiliPolluterPlugin(Star):
                         logger.debug(f"找到符合时长的视频: {title} ({duration_text})")
                         
                     except Exception as e:
+                        logger.error(f"解析视频信息失败: {e}")
                         continue
                 
                 # 页间延迟
                 if page < max_pages:
                     await asyncio.sleep(random.uniform(0.5, 1))
                     
+            except asyncio.TimeoutError:
+                logger.warning(f"搜索关键词 '{keyword}' 第{page}页超时")
+                continue
             except Exception as e:
                 logger.error(f"搜索关键词 '{keyword}' 第{page}页出错: {e}")
                 break
@@ -329,7 +378,7 @@ class BilibiliPolluterPlugin(Star):
         logger.info(f"关键词 '{keyword}' 搜索完成: 找到 {len(videos)} 个符合时长的视频")
         return videos
 
-    async def _find_random_video(self) -> Optional[Dict]:
+    async def _select_random_video(self) -> Optional[Dict[str, Any]]:
         """随机选一个关键词，随机找一个符合时长要求的视频"""
         keywords = self.config.get('search_keywords', self.default_keywords)
         
@@ -361,7 +410,7 @@ class BilibiliPolluterPlugin(Star):
             
             logger.info(f"随机选中视频: {selected['title']} (时长: {selected['duration']}, {duration}秒)")
             
-            # 二次确认时长（虽然搜索时已经过滤，但再检查一下）
+            # 二次确认时长
             if duration <= max_duration:
                 return selected
             else:
@@ -373,34 +422,26 @@ class BilibiliPolluterPlugin(Star):
 
     # ==================== 下载部分 ====================
 
-    async def _get_video_urls(self, bvid: str):
+    async def _get_video_urls(self, bvid: str) -> tuple[Optional[str], Optional[str]]:
         """获取视频和音频URL"""
+        if not self.session:
+            logger.error("HTTP会话未初始化")
+            return None, None
+        
         url = f"https://www.bilibili.com/video/{bvid}"
         
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.bilibili.com/'
-        })
-        
         try:
-            loop = asyncio.get_event_loop()
+            # 使用信号量控制并发
+            async with self.semaphore:
+                # 获取页面内容
+                async with self.session.get(url, allow_redirects=True) as response:
+                    if response.status != 200:
+                        logger.error(f"获取页面失败: {response.status}")
+                        return None, None
+                    
+                    html_content = await response.text()
             
-            # 1. 先发HEAD请求获取最终URL（处理重定向）
-            response = await loop.run_in_executor(
-                None,
-                lambda: session.head(url, allow_redirects=True, timeout=10)
-            )
-            final_url = response.url
-            
-            # 2. 获取页面内容
-            response = await loop.run_in_executor(
-                None,
-                lambda: session.get(final_url, timeout=10)
-            )
-            html_content = response.text
-            
-            # 3. 提取 window.__playinfo__
+            # 提取 window.__playinfo__
             playinfo_match = re.search(r'window\.__playinfo__=(.*?)</script>', html_content)
             if not playinfo_match:
                 logger.error(f"未找到playinfo: {bvid}")
@@ -408,70 +449,85 @@ class BilibiliPolluterPlugin(Star):
             
             playinfo = json.loads(playinfo_match.group(1))
             
-            # 4. 解析视频和音频URL
+            # 解析视频和音频URL
             if 'data' in playinfo and 'dash' in playinfo['data']:
                 video_qualities = playinfo['data']['dash'].get('video', [])
                 audio_qualities = playinfo['data']['dash'].get('audio', [])
                 
-                if video_qualities and audio_qualities:
-                    # 选最高画质
-                    best_video = max(video_qualities, key=lambda x: x.get('bandwidth', 0))
-                    best_audio = max(audio_qualities, key=lambda x: x.get('bandwidth', 0))
-                    
-                    video_url = best_video.get('baseUrl')
-                    audio_url = best_audio.get('baseUrl')
-                    
-                    return video_url, audio_url
+                if not video_qualities:
+                    logger.error(f"没有找到视频流: {bvid}")
+                    return None, None
+                
+                if not audio_qualities:
+                    logger.error(f"没有找到音频流: {bvid}")
+                    return None, None
+                
+                # 选最高画质
+                best_video = max(video_qualities, key=lambda x: x.get('bandwidth', 0))
+                best_audio = max(audio_qualities, key=lambda x: x.get('bandwidth', 0))
+                
+                video_url = best_video.get('baseUrl')
+                audio_url = best_audio.get('baseUrl')
+                
+                # 验证URL安全性
+                if video_url and not video_url.startswith('https://'):
+                    logger.warning(f"视频URL不是HTTPS: {video_url[:50]}")
+                
+                return video_url, audio_url
             
             return None, None
             
+        except json.JSONDecodeError as e:
+            logger.error(f"解析playinfo JSON失败 {bvid}: {e}")
+            return None, None
         except Exception as e:
-            logger.error(f"解析视频URL失败 {bvid}: {e}")
+            logger.error(f"获取视频URL失败 {bvid}: {e}")
             return None, None
 
-    async def _download_file(self, url: str, output_path: str, progress_callback=None) -> bool:
-        """下载文件"""
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.bilibili.com/'
-        })
+    async def _download_file(self, url: str, output_path: str) -> bool:
+        """下载文件（使用aiohttp）"""
+        if not self.session:
+            logger.error("HTTP会话未初始化")
+            return False
         
         try:
-            loop = asyncio.get_event_loop()
-            
-            def download():
-                response = session.get(url, stream=True, timeout=30)
-                if response.status_code != 200:
-                    return False
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded_size = 0
-                
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                            if total_size > 0 and progress_callback:
-                                progress = (downloaded_size / total_size) * 100
-                                progress_callback(progress)
-                
-                return True
-            
-            return await loop.run_in_executor(None, download)
-            
+            async with self.semaphore:
+                async with self.session.get(url) as response:
+                    if response.status != 200:
+                        logger.error(f"下载失败: HTTP {response.status}")
+                        return False
+                    
+                    # 流式写入文件
+                    async with aiofiles.open(output_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            await f.write(chunk)
+                    
+                    return True
+                    
+        except asyncio.TimeoutError:
+            logger.error(f"下载超时: {url[:50]}")
+            return False
         except Exception as e:
             logger.error(f"下载出错: {e}")
             return False
 
     async def _merge_video_audio(self, video_path: str, audio_path: str, output_path: str) -> bool:
-        """合并视频和音频"""
+        """合并视频和音频（使用subprocess，避免shell注入）"""
         try:
-            cmd = f'ffmpeg -i "{video_path}" -i "{audio_path}" -c:v copy -c:a aac "{output_path}" -y -hide_banner -loglevel error'
+            # 使用列表形式调用，避免shell注入
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-i', audio_path,
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-y',
+                '-hide_banner',
+                '-loglevel', 'error'
+            ]
             
-            process = await asyncio.create_subprocess_shell(
-                cmd,
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -480,8 +536,12 @@ class BilibiliPolluterPlugin(Star):
             if process.returncode == 0:
                 # 成功时删除临时文件
                 for path in [video_path, audio_path]:
-                    if os.path.exists(path):
-                        os.remove(path)
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                            self.temp_files.discard(path)
+                    except Exception as e:
+                        logger.warning(f"删除临时文件失败 {path}: {e}")
                 return True
             else:
                 logger.error(f"合并失败: {stderr.decode()[:200]}")
@@ -491,7 +551,7 @@ class BilibiliPolluterPlugin(Star):
             logger.error(f"合并出错: {e}")
             return False
 
-    async def _download_video(self, video_info: Dict) -> Optional[str]:
+    async def _download_video(self, video_info: Dict[str, Any]) -> Optional[str]:
         """下载单个视频"""
         bvid = video_info.get('bvid', '')
         title = video_info.get('title', '未知标题')
@@ -506,29 +566,37 @@ class BilibiliPolluterPlugin(Star):
             unique_id = str(uuid.uuid4())[:8]
             
             # 临时文件路径
-            video_temp = os.path.join(self.config["download_dir"], f"video_{unique_id}.m4s")
-            audio_temp = os.path.join(self.config["download_dir"], f"audio_{unique_id}.m4s")
-            output_path = os.path.join(self.config["download_dir"], f"{cleaned_title}_{unique_id}.mp4")
+            video_temp = self.download_dir / f"video_{unique_id}.m4s"
+            audio_temp = self.download_dir / f"audio_{unique_id}.m4s"
+            output_path = self.download_dir / f"{cleaned_title}_{unique_id}.mp4"
             
-            self.temp_files.extend([video_temp, audio_temp, output_path])
+            # 记录临时文件
+            self.temp_files.add(str(video_temp))
+            self.temp_files.add(str(audio_temp))
+            self.temp_files.add(str(output_path))
             
             # 获取视频和音频URL
             logger.info(f"获取下载地址: {bvid}")
             video_url, audio_url = await self._get_video_urls(bvid)
+            
             if not video_url:
-                logger.error(f"获取下载地址失败: {bvid}")
+                logger.error(f"获取视频地址失败: {bvid}")
+                return None
+            
+            if not audio_url:
+                logger.error(f"获取音频地址失败: {bvid}")
                 return None
             
             # 下载视频
             logger.info(f"下载视频: {title}")
-            video_success = await self._download_file(video_url, video_temp)
+            video_success = await self._download_file(video_url, str(video_temp))
             if not video_success:
                 logger.error(f"视频下载失败: {bvid}")
                 return None
             
             # 下载音频
             logger.info(f"下载音频: {title}")
-            audio_success = await self._download_file(audio_url, audio_temp)
+            audio_success = await self._download_file(audio_url, str(audio_temp))
             if not audio_success:
                 logger.error(f"音频下载失败: {bvid}")
                 return None
@@ -536,11 +604,12 @@ class BilibiliPolluterPlugin(Star):
             # 合并
             if self.ffmpeg_available:
                 logger.info(f"合并视频音频: {title}")
-                merge_success = await self._merge_video_audio(video_temp, audio_temp, output_path)
+                merge_success = await self._merge_video_audio(str(video_temp), str(audio_temp), str(output_path))
                 if merge_success:
                     logger.info(f"下载完成: {output_path}")
-                    return output_path
+                    return str(output_path)
                 else:
+                    logger.error("合并失败")
                     return None
             else:
                 logger.error("FFmpeg不可用，无法合并")
@@ -552,8 +621,8 @@ class BilibiliPolluterPlugin(Star):
 
     # ==================== 发送部分 ====================
 
-    async def _send_to_current_chat(self, event: AstrMessageEvent, file_path: str, video_info: Dict):
-        """发送到当前聊天（用于 /bilibanshi now 命令）"""
+    def _create_video_message(self, video_info: Dict[str, Any], file_path: str) -> List[Any]:
+        """创建视频消息链"""
         title = video_info.get('title', '未知标题')
         author = video_info.get('author', '未知UP主')
         play = video_info.get('play_count', 0)
@@ -570,139 +639,136 @@ class BilibiliPolluterPlugin(Star):
             f"链接：https://www.bilibili.com/video/{bvid}"
         )
         
-        try:
-            # 构建消息链
-            chain = [Plain(text_msg)]
-            
-            # 检查文件是否存在
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                video = Video.fromFileSystem(path=file_path)
-                chain.append(video)
-                logger.info(f"添加视频到消息链: {file_path}")
-            
-            # 使用 event.chain_result 发送
-            yield event.chain_result(chain)
-            logger.info("已发送到当前聊天")
-            
-        except Exception as e:
-            logger.error(f"发送到当前聊天失败: {e}")
-            yield event.plain_result(f"发送失败: {e}")
+        chain = [Plain(text_msg)]
+        
+        # 检查文件是否存在
+        if file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            video = Video.fromFileSystem(path=file_path)
+            chain.append(video)
+        
+        return chain
 
-    async def _send_to_all_groups(self, file_path: str, video_info: Dict):
-        """发送到所有已绑定的群（用于定时任务）"""
+    async def _send_to_current_chat(self, event: AstrMessageEvent, file_path: str, video_info: Dict[str, Any]):
+        """发送到当前聊天"""
+        chain = self._create_video_message(video_info, file_path)
+        yield event.chain_result(chain)
+        logger.info("已发送到当前聊天")
+
+    async def _send_to_all_groups(self, file_path: str, video_info: Dict[str, Any]):
+        """发送到所有已绑定的群（带并发控制和错误处理）"""
         bound_groups = self.config.get('bound_groups', {})
-        blacklist = [str(b) for b in self.config.get('blacklist_groups', [])]
+        blacklist = set(str(b) for b in self.config.get('blacklist_groups', []))
         
         if not bound_groups:
             logger.warning("没有已绑定的群，等待自动记录...")
             return
         
-        title = video_info.get('title', '未知标题')
-        author = video_info.get('author', '未知UP主')
-        play = video_info.get('play_count', 0)
-        bvid = video_info.get('bvid', '')
-        duration = video_info.get('duration', '未知')
+        chain = self._create_video_message(video_info, file_path)
+        message_chain = MessageChain(chain)
         
-        # 文字消息
-        text_msg = (
-            f"【B站搬石-定时任务】\n"
-            f"标题：{title}\n"
-            f"UP主：{author}\n"
-            f"时长：{duration}\n"
-            f"播放量：{play}\n"
-            f"链接：https://www.bilibili.com/video/{bvid}"
-        )
+        # 使用信号量控制并发发送（最多同时发3个群）
+        send_semaphore = Semaphore(3)
         
-        # 检查文件
-        file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
-        
-        for group_id, umo in bound_groups.items():
-            # 检查黑名单
+        async def send_to_group(group_id: str, umo: str):
             if group_id in blacklist:
-                logger.info(f"群 {group_id} 在黑名单中，跳过")
-                continue
+                logger.debug(f"群 {group_id} 在黑名单中，跳过")
+                return
             
-            try:
-                # 构建消息链（列表形式）
-                chain = [Plain(text_msg)]
-                
-                if file_exists:
-                    video = Video.fromFileSystem(path=file_path)
-                    chain.append(video)
-                
-                # 转换成 MessageChain 再发送
-                message_chain = MessageChain(chain)
-                await self.context.send_message(umo, message_chain)
-                logger.info(f"已发送到群 {group_id}")
-                
+            async with send_semaphore:
+                try:
+                    await self.context.send_message(umo, message_chain)
+                    logger.info(f"已发送到群 {group_id}")
+                except Exception as e:
+                    logger.error(f"发送到群 {group_id} 失败: {e}")
                 # 群之间延迟
-                await asyncio.sleep(2)
-                
-            except Exception as e:
-                logger.error(f"发送到群 {group_id} 失败: {e}")
-
-    # ==================== 主流程 ====================
-
-    async def _scan_and_download(self, event: AstrMessageEvent = None):
-        """扫描并随机下载一个视频
-        Args:
-            event: 如果有 event，说明是 /bilibanshi now 命令触发的，发送到当前聊天
-                   如果没有 event，说明是定时任务，发送到所有已绑定的群
-        """
-        logger.info("开始随机搬石...")
+                await asyncio.sleep(1)
         
-        # 随机找一个符合时长的视频
-        target = await self._find_random_video()
+        # 并发发送
+        tasks = [send_to_group(gid, umo) for gid, umo in bound_groups.items()]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ==================== 核心流程 ====================
+
+    async def _execute_scan_and_download(self, event: Optional[AstrMessageEvent] = None):
+        """
+        执行扫描和下载的核心逻辑
+        返回: (成功标志, 文件路径, 视频信息)
+        """
+        # 随机选择一个视频
+        target = await self._select_random_video()
         
         if not target:
             logger.error("没有找到合适的视频")
-            if event:
-                yield event.plain_result("❌ 没有找到合适的视频")
-            return
+            return False, None, None
         
         logger.info(f"选中视频: {target['title']} (BV: {target['bvid']}, 时长: {target['duration']})")
         
-        if event:
-            yield event.plain_result(f"✅ 选中视频: {target['title']}\n⏳ 开始下载...")
-        
-        # 下载
+        # 下载视频
         file_path = await self._download_video(target)
         
-        if file_path and os.path.exists(file_path):
-            logger.info(f"下载成功: {file_path}")
-            
-            if event:
-                # /bilibanshi now 命令：发送到当前聊天
-                async for result in self._send_to_current_chat(event, file_path, target):
-                    yield result
-            else:
-                # 定时任务：发送到所有已绑定的群
-                await self._send_to_all_groups(file_path, target)
-            
-            # 发送后删除
-            if self.config.get('delete_after_send', True):
-                try:
-                    os.remove(file_path)
-                    logger.info(f"已删除文件: {file_path}")
-                except Exception as e:
-                    logger.error(f"删除文件失败: {e}")
-        else:
+        if not file_path or not os.path.exists(file_path):
             logger.error("下载失败")
+            return False, None, target
+        
+        return True, file_path, target
+
+    async def _cleanup_after_send(self, file_path: str):
+        """发送后清理文件"""
+        if self.config.get('delete_after_send', True) and file_path:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    self.temp_files.discard(file_path)
+                    logger.info(f"已删除文件: {file_path}")
+            except Exception as e:
+                logger.error(f"删除文件失败: {e}")
+
+    async def _scan_and_download(self, event: Optional[AstrMessageEvent] = None):
+        """
+        扫描并下载视频的主流程
+        Args:
+            event: 如果有 event，说明是命令触发的，发送到当前聊天
+                  如果没有 event，说明是定时任务，发送到所有已绑定的群
+        """
+        logger.info("开始随机搬石...")
+        
+        # 执行下载
+        success, file_path, video_info = await self._execute_scan_and_download(event)
+        
+        if not success:
             if event:
-                yield event.plain_result("❌ 下载失败")
+                yield event.plain_result("❌ 没有找到合适的视频或下载失败")
+            return
+        
+        # 发送消息
+        if event:
+            # 命令触发：发送到当前聊天
+            async for result in self._send_to_current_chat(event, file_path, video_info):
+                yield result
+        else:
+            # 定时任务：发送到所有群
+            await self._send_to_all_groups(file_path, video_info)
+        
+        # 清理文件
+        await self._cleanup_after_send(file_path)
 
     async def _timer_task(self):
-        """定时任务（1分钟一次）"""
+        """定时任务（带异常恢复）"""
         while self.running:
             try:
-                # 定时任务不传 event，会发送到所有已绑定的群
-                # 注意：这里要用 async for 遍历，不能用 await
-                async for _ in self._scan_and_download():
-                    pass  # 定时任务不需要处理返回值
+                # 执行扫描和下载
+                await self._scan_and_download()
+                
+                # 等待下一次扫描
+                await asyncio.sleep(self.config['scan_interval'])
+                
+            except asyncio.CancelledError:
+                logger.info("定时任务被取消")
+                break
             except Exception as e:
                 logger.error(f"定时任务异常: {e}")
-            
-            await asyncio.sleep(self.config['scan_interval'])  # 默认60秒
+                # 发生异常时等待较长时间再重试，避免频繁失败
+                await asyncio.sleep(60)
 
     # ==================== 指令区 ====================
 
@@ -729,8 +795,10 @@ class BilibiliPolluterPlugin(Star):
             self.task.cancel()
             try:
                 await self.task
-            except:
-                pass
+            except asyncio.CancelledError:
+                logger.info("定时任务已取消")
+            except Exception as e:
+                logger.error(f"停止定时任务时出错: {e}")
             self.task = None
         yield event.plain_result("B站搬石已关闭")
 
@@ -755,7 +823,7 @@ class BilibiliPolluterPlugin(Star):
             f"已绑定的群: {len(bound_groups)} 个",
             f"黑名单群: {len(self.config.get('blacklist_groups', []))} 个",
             f"关键词: {len(self.config.get('search_keywords', self.default_keywords))} 个",
-            f"下载目录: {self.config['download_dir']}",
+            f"数据目录: {self.data_dir}",
             f"FFmpeg: {'✅ 可用' if self.ffmpeg_available else '❌ 不可用'}",
         ]
         
@@ -765,15 +833,17 @@ class BilibiliPolluterPlugin(Star):
         
         yield event.plain_result("\n".join(status))
 
-    @filter.command("bilibanshi h")
-    async def add_blacklist(self, event: AstrMessageEvent):
-        """添加黑名单群: /bilibanshi h 123456"""
+    @filter.command("bilibanshi blacklist")
+    async def manage_blacklist(self, event: AstrMessageEvent):
+        """管理黑名单: /bilibanshi blacklist add 123456 或 /bilibanshi blacklist remove 123456"""
         parts = event.message_str.strip().split()
-        if len(parts) < 3:
-            yield event.plain_result("用法: /bilibanshi h <群号>")
+        if len(parts) < 4:
+            yield event.plain_result("用法: /bilibanshi blacklist <add|remove> <群号>")
             return
         
-        group_id = parts[2]
+        action = parts[2].lower()
+        group_id = parts[3]
+        
         if not group_id.isdigit():
             yield event.plain_result("群号必须是数字")
             return
@@ -781,63 +851,53 @@ class BilibiliPolluterPlugin(Star):
         if 'blacklist_groups' not in self.config:
             self.config['blacklist_groups'] = []
         
-        if group_id not in self.config['blacklist_groups']:
-            self.config['blacklist_groups'].append(group_id)
-            self._save_config()
-            yield event.plain_result(f"已添加黑名单群: {group_id}")
+        if action == "add":
+            if group_id not in self.config['blacklist_groups']:
+                self.config['blacklist_groups'].append(group_id)
+                await self._save_config()
+                yield event.plain_result(f"✅ 已添加黑名单群: {group_id}")
+            else:
+                yield event.plain_result("该群已在黑名单中")
+        elif action == "remove":
+            if group_id in self.config['blacklist_groups']:
+                self.config['blacklist_groups'].remove(group_id)
+                await self._save_config()
+                yield event.plain_result(f"✅ 已移除黑名单群: {group_id}")
+            else:
+                yield event.plain_result("该群不在黑名单中")
         else:
-            yield event.plain_result("该群已在黑名单中")
+            yield event.plain_result("未知操作，请使用 add 或 remove")
 
-    @filter.command("bilibanshi -h")
-    async def remove_blacklist(self, event: AstrMessageEvent):
-        """移除黑名单群: /bilibanshi -h 123456"""
+    @filter.command("bilibanshi keyword")
+    async def manage_keyword(self, event: AstrMessageEvent):
+        """管理关键词: /bilibanshi keyword add 搞笑 或 /bilibanshi keyword remove 搞笑"""
         parts = event.message_str.strip().split()
-        if len(parts) < 3:
-            yield event.plain_result("用法: /bilibanshi -h <群号>")
+        if len(parts) < 4:
+            yield event.plain_result("用法: /bilibanshi keyword <add|remove> <关键词>")
             return
         
-        group_id = parts[2]
-        if 'blacklist_groups' in self.config and group_id in self.config['blacklist_groups']:
-            self.config['blacklist_groups'].remove(group_id)
-            self._save_config()
-            yield event.plain_result(f"已移除黑名单群: {group_id}")
-        else:
-            yield event.plain_result("该群不在黑名单中")
-
-    @filter.command("bilibanshi c")
-    async def add_keyword(self, event: AstrMessageEvent):
-        """添加搜索关键词: /bilibanshi c 搞笑"""
-        parts = event.message_str.strip().split()
-        if len(parts) < 3:
-            yield event.plain_result("用法: /bilibanshi c <关键词>")
-            return
+        action = parts[2].lower()
+        keyword = ' '.join(parts[3:])  # 支持带空格的关键词
         
-        keyword = ' '.join(parts[2:])  # 支持带空格的关键词
         if 'search_keywords' not in self.config:
             self.config['search_keywords'] = self.default_keywords.copy()
         
-        if keyword not in self.config['search_keywords']:
-            self.config['search_keywords'].append(keyword)
-            self._save_config()
-            yield event.plain_result(f"已添加关键词: {keyword}")
+        if action == "add":
+            if keyword not in self.config['search_keywords']:
+                self.config['search_keywords'].append(keyword)
+                await self._save_config()
+                yield event.plain_result(f"✅ 已添加关键词: {keyword}")
+            else:
+                yield event.plain_result("该关键词已存在")
+        elif action == "remove":
+            if keyword in self.config['search_keywords']:
+                self.config['search_keywords'].remove(keyword)
+                await self._save_config()
+                yield event.plain_result(f"✅ 已删除关键词: {keyword}")
+            else:
+                yield event.plain_result("未找到该关键词")
         else:
-            yield event.plain_result("该关键词已存在")
-
-    @filter.command("bilibanshi del")
-    async def remove_keyword(self, event: AstrMessageEvent):
-        """删除搜索关键词: /bilibanshi del 搞笑"""
-        parts = event.message_str.strip().split()
-        if len(parts) < 3:
-            yield event.plain_result("用法: /bilibanshi del <关键词>")
-            return
-        
-        keyword = ' '.join(parts[2:])
-        if 'search_keywords' in self.config and keyword in self.config['search_keywords']:
-            self.config['search_keywords'].remove(keyword)
-            self._save_config()
-            yield event.plain_result(f"已删除关键词: {keyword}")
-        else:
-            yield event.plain_result("未找到该关键词")
+            yield event.plain_result("未知操作，请使用 add 或 remove")
 
     @filter.command("bilibanshi interval")
     async def set_interval(self, event: AstrMessageEvent):
@@ -854,7 +914,7 @@ class BilibiliPolluterPlugin(Star):
                 return
             
             self.config['scan_interval'] = interval
-            self._save_config()
+            await self._save_config()
             yield event.plain_result(f"已设置扫描间隔: {interval}秒")
         except ValueError:
             yield event.plain_result("请输入有效的数字")
@@ -874,7 +934,14 @@ class BilibiliPolluterPlugin(Star):
                 return
             
             self.config['max_duration'] = duration
-            self._save_config()
+            await self._save_config()
             yield event.plain_result(f"已设置最大时长: {duration}秒 ({duration//60}分钟)")
         except ValueError:
             yield event.plain_result("请输入有效的数字")
+
+    @filter.command("bilibanshi clean")
+    async def clean_temp_files(self, event: AstrMessageEvent):
+        """手动清理临时文件"""
+        count = len(self.temp_files)
+        await self._cleanup_temp_files()
+        yield event.plain_result(f"已清理 {count} 个临时文件")
