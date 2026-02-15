@@ -691,15 +691,14 @@ class BilibiliPolluterPlugin(Star):
                 yield event.plain_result("❌ 下载失败")
 
     async def _timer_task(self):
-        """定时任务（1分钟一次）"""
         while self.running:
             try:
-                # 定时任务不传 event，会发送到所有已绑定的群
-                await self._scan_and_download()
+                async for _ in self._scan_and_download():
+                    pass  
             except Exception as e:
                 logger.error(f"定时任务异常: {e}")
-            
-            await asyncio.sleep(self.config['scan_interval'])  # 默认60秒
+        
+            await asyncio.sleep(self.config['scan_interval'])
 
     # ==================== 指令区 ====================
 
