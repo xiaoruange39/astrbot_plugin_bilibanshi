@@ -75,9 +75,9 @@ class BilibiliPolluterPlugin(Star):
         default_config = {
             "auto_start": True,
             "download_dir": str(Path("data") / "plugins" / "bilibili_polluter" / "downloads"),
-            "scan_interval": 3600,           # 1小时扫一次
-            "target_groups": [],              # 目标群（为空则发所有群）
+            "scan_interval": 60,              # 1分钟扫一次
             "blacklist_groups": [],           # 黑名单群
+            "bound_groups": {},                # 已绑定的群 {group_id: unified_msg_origin}
             "search_keywords": self.default_keywords.copy(),
             "delete_after_send": True,        # 发送后删除
             "max_pages": 5,                   # 搜索页数
@@ -140,6 +140,32 @@ class BilibiliPolluterPlugin(Star):
         
         return cleaned.strip()
 
+    # ==================== 懒人模式：自动记录群 ====================
+    
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_group_message(self, event: AstrMessageEvent):
+        """自动记录群 unified_msg_origin（懒人模式）"""
+        try:
+            # 获取 unified_msg_origin 和群号
+            umo = event.unified_msg_origin
+            group_id = str(event.message_obj.group_id)
+            
+            if not group_id or not umo:
+                return
+            
+            # 初始化存储结构
+            if 'bound_groups' not in self.config:
+                self.config['bound_groups'] = {}
+            
+            # 如果是新群，自动记录
+            if group_id not in self.config['bound_groups']:
+                self.config['bound_groups'][group_id] = umo
+                self._save_config()
+                logger.info(f"✅ 自动记录新群: {group_id}, umo: {umo}")
+                
+        except Exception as e:
+            logger.error(f"自动记录群失败: {e}")
+
     # ==================== 搜索部分 ====================
 
     def _parse_play_count(self, play_text) -> int:
@@ -184,9 +210,9 @@ class BilibiliPolluterPlugin(Star):
             if ':' in duration_text:
                 parts = duration_text.split(':')
                 if len(parts) == 2:  # MM:SS
-                    return int(parts[0]) * 60 + int(parts[2])
+                    return int(parts[0]) * 60 + int(parts[1])
                 elif len(parts) == 3:  # HH:MM:SS
-                    return int(parts[0]) * 3600 + int(parts[2]) * 60 + int(parts[2])
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             
             # 处理纯数字（秒）
             return int(duration_text)
@@ -524,20 +550,7 @@ class BilibiliPolluterPlugin(Star):
             logger.error(f"下载视频异常: {e}")
             return None
 
-    # ==================== 发送部分（修复版）====================
-
-    async def _get_all_groups(self) -> List[str]:
-        """获取所有群ID"""
-        try:
-            # 尝试从context获取群列表
-            groups = await self.context.get_all_groups()
-            if groups:
-                return [str(g.id) for g in groups]
-        except Exception as e:
-            logger.error(f"获取群列表失败: {e}")
-        
-        # 如果无法获取，返回空列表
-        return []
+    # ==================== 发送部分 ====================
 
     async def _send_to_current_chat(self, event: AstrMessageEvent, file_path: str, video_info: Dict):
         """发送到当前聊天（用于 /bilibanshi now 命令）"""
@@ -567,7 +580,7 @@ class BilibiliPolluterPlugin(Star):
                 chain.append(video)
                 logger.info(f"添加视频到消息链: {file_path}")
             
-            # 使用 event.chain_result 发送（因为是在命令中）
+            # 使用 event.chain_result 发送
             yield event.chain_result(chain)
             logger.info("已发送到当前聊天")
             
@@ -576,20 +589,12 @@ class BilibiliPolluterPlugin(Star):
             yield event.plain_result(f"发送失败: {e}")
 
     async def _send_to_all_groups(self, file_path: str, video_info: Dict):
-        """发送到所有群（用于定时任务）"""
-        # 获取所有群
-        all_groups = await self._get_all_groups()
+        """发送到所有已绑定的群（用于定时任务）"""
+        bound_groups = self.config.get('bound_groups', {})
         blacklist = [str(b) for b in self.config.get('blacklist_groups', [])]
         
-        if not all_groups:
-            logger.warning("没有获取到任何群")
-            return
-        
-        # 过滤黑名单
-        groups_to_send = [g for g in all_groups if g not in blacklist]
-        
-        if not groups_to_send:
-            logger.warning("所有群都在黑名单中，无法发送")
+        if not bound_groups:
+            logger.warning("没有已绑定的群，等待自动记录...")
             return
         
         title = video_info.get('title', '未知标题')
@@ -611,7 +616,12 @@ class BilibiliPolluterPlugin(Star):
         # 检查文件
         file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
         
-        for group_id in groups_to_send:
+        for group_id, umo in bound_groups.items():
+            # 检查黑名单
+            if group_id in blacklist:
+                logger.info(f"群 {group_id} 在黑名单中，跳过")
+                continue
+            
             try:
                 # 构建消息链
                 chain = [Plain(text_msg)]
@@ -620,10 +630,8 @@ class BilibiliPolluterPlugin(Star):
                     video = Video.fromFileSystem(path=file_path)
                     chain.append(video)
                 
-                # 定时任务中使用 context.send_message
-                # 注意：这里假设 group_id 可以直接作为 unified_msg_origin
-                # 如果不行，需要先获取 unified_msg_origin
-                await self.context.send_message(group_id, chain)
+                # 使用存储的 unified_msg_origin 发送
+                await self.context.send_message(umo, chain)
                 logger.info(f"已发送到群 {group_id}")
                 
                 # 群之间延迟
@@ -632,13 +640,13 @@ class BilibiliPolluterPlugin(Star):
             except Exception as e:
                 logger.error(f"发送到群 {group_id} 失败: {e}")
 
-    # ==================== 主流程（修改版）====================
+    # ==================== 主流程 ====================
 
     async def _scan_and_download(self, event: AstrMessageEvent = None):
         """扫描并随机下载一个视频
         Args:
             event: 如果有 event，说明是 /bilibanshi now 命令触发的，发送到当前聊天
-                   如果没有 event，说明是定时任务，发送到所有群
+                   如果没有 event，说明是定时任务，发送到所有已绑定的群
         """
         logger.info("开始随机搬石...")
         
@@ -667,7 +675,7 @@ class BilibiliPolluterPlugin(Star):
                 async for result in self._send_to_current_chat(event, file_path, target):
                     yield result
             else:
-                # 定时任务：发送到所有群
+                # 定时任务：发送到所有已绑定的群
                 await self._send_to_all_groups(file_path, target)
             
             # 发送后删除
@@ -683,17 +691,17 @@ class BilibiliPolluterPlugin(Star):
                 yield event.plain_result("❌ 下载失败")
 
     async def _timer_task(self):
-        """定时任务"""
+        """定时任务（1分钟一次）"""
         while self.running:
             try:
-                # 定时任务不传 event，会发送到所有群
+                # 定时任务不传 event，会发送到所有已绑定的群
                 await self._scan_and_download()
             except Exception as e:
                 logger.error(f"定时任务异常: {e}")
             
-            await asyncio.sleep(self.config['scan_interval'])
+            await asyncio.sleep(self.config['scan_interval'])  # 默认60秒
 
-    # ==================== 指令区（保持原有格式）====================
+    # ==================== 指令区 ====================
 
     @filter.command("bilibanshi on")
     async def turn_on(self, event: AstrMessageEvent):
@@ -704,7 +712,7 @@ class BilibiliPolluterPlugin(Star):
         
         self.running = True
         self.task = asyncio.create_task(self._timer_task())
-        yield event.plain_result("B站搬石已开启")
+        yield event.plain_result("B站搬石已开启 (1分钟一次)")
 
     @filter.command("bilibanshi off")
     async def turn_off(self, event: AstrMessageEvent):
@@ -727,7 +735,6 @@ class BilibiliPolluterPlugin(Star):
     async def scan_now(self, event: AstrMessageEvent):
         """立即执行一次（发送到当前聊天）"""
         yield event.plain_result("开始搬石...")
-        # 传入 event，会发送到当前聊天
         async for result in self._scan_and_download(event):
             yield result
 
@@ -735,28 +742,31 @@ class BilibiliPolluterPlugin(Star):
     async def list_status(self, event: AstrMessageEvent):
         """查看当前状态"""
         max_duration = self.config.get('max_duration', 600)
-        
-        # 获取所有群
-        all_groups = await self._get_all_groups()
+        bound_groups = self.config.get('bound_groups', {})
         
         status = [
             "=== B站搬石状态 ===",
             f"运行状态: {'✅ 运行中' if self.running else '❌ 已停止'}",
             f"扫描间隔: {self.config['scan_interval']}秒",
             f"最大时长: {max_duration}秒 ({max_duration//60}分钟)",
-            f"机器人加入的群: {len(all_groups)} 个",
+            f"已绑定的群: {len(bound_groups)} 个",
             f"黑名单群: {len(self.config.get('blacklist_groups', []))} 个",
             f"关键词: {len(self.config.get('search_keywords', self.default_keywords))} 个",
             f"下载目录: {self.config['download_dir']}",
             f"FFmpeg: {'✅ 可用' if self.ffmpeg_available else '❌ 不可用'}",
         ]
+        
+        # 显示已绑定的群号
+        if bound_groups:
+            status.append(f"群列表: {', '.join(bound_groups.keys())}")
+        
         yield event.plain_result("\n".join(status))
 
     @filter.command("bilibanshi h")
     async def add_blacklist(self, event: AstrMessageEvent):
         """添加黑名单群: /bilibanshi h 123456"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi h <群号>")
             return
         
@@ -779,7 +789,7 @@ class BilibiliPolluterPlugin(Star):
     async def remove_blacklist(self, event: AstrMessageEvent):
         """移除黑名单群: /bilibanshi -h 123456"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi -h <群号>")
             return
         
@@ -795,7 +805,7 @@ class BilibiliPolluterPlugin(Star):
     async def add_keyword(self, event: AstrMessageEvent):
         """添加搜索关键词: /bilibanshi c 搞笑"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi c <关键词>")
             return
         
@@ -814,11 +824,11 @@ class BilibiliPolluterPlugin(Star):
     async def remove_keyword(self, event: AstrMessageEvent):
         """删除搜索关键词: /bilibanshi del 搞笑"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi del <关键词>")
             return
         
-        keyword = ' '.join(parts[1:])
+        keyword = ' '.join(parts[2:])
         if 'search_keywords' in self.config and keyword in self.config['search_keywords']:
             self.config['search_keywords'].remove(keyword)
             self._save_config()
@@ -828,16 +838,16 @@ class BilibiliPolluterPlugin(Star):
 
     @filter.command("bilibanshi interval")
     async def set_interval(self, event: AstrMessageEvent):
-        """设置扫描间隔(秒): /bilibanshi interval 3600"""
+        """设置扫描间隔(秒): /bilibanshi interval 60"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi interval <秒数>")
             return
         
         try:
             interval = int(parts[2])
-            if interval < 60:
-                yield event.plain_result("间隔不能小于60秒")
+            if interval < 10:
+                yield event.plain_result("间隔不能小于10秒")
                 return
             
             self.config['scan_interval'] = interval
@@ -850,7 +860,7 @@ class BilibiliPolluterPlugin(Star):
     async def set_max_duration(self, event: AstrMessageEvent):
         """设置最大时长（秒）: /bilibanshi maxduration 600"""
         parts = event.message_str.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             yield event.plain_result("用法: /bilibanshi maxduration <秒数>")
             return
         
