@@ -799,7 +799,7 @@ class BilibiliPolluterPlugin(Star):
             yield event.plain_result("用法: /bilibanshi c <关键词>")
             return
         
-        keyword = ' '.join(parts[1:])  # 支持带空格的关键词
+        keyword = ' '.join(parts[2:])  # 支持带空格的关键词
         if 'search_keywords' not in self.config:
             self.config['search_keywords'] = self.default_keywords.copy()
         
