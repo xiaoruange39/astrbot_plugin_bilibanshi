@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional, Set
 from urllib.parse import quote
 from asyncio import Semaphore
 import shutil
+from datetime import datetime
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -776,10 +777,36 @@ class BilibiliPolluterPlugin(Star):
         # 清理文件
         await self._cleanup_after_send(file_path)
 
+    def _is_quiet_hours(self) -> bool:
+        """检查当前是否在免打扰时段内"""
+        quiet_start = self.config.get('quiet_hours_start', '')
+        quiet_end = self.config.get('quiet_hours_end', '')
+        
+        if not quiet_start or not quiet_end:
+            return False
+        
+        try:
+            now = datetime.now().strftime('%H:%M')
+            if quiet_start <= quiet_end:
+                # 正常范围，如 01:00 - 08:00
+                return quiet_start <= now < quiet_end
+            else:
+                # 跨午夜范围，如 23:00 - 08:00
+                return now >= quiet_start or now < quiet_end
+        except Exception as e:
+            logger.error(f"解析免打扰时段失败: {e}")
+            return False
+
     async def _timer_task(self):
         """定时任务（带异常恢复）"""
         while self.running:
             try:
+                # 检查免打扰时段
+                if self._is_quiet_hours():
+                    logger.debug("当前在免打扰时段，跳过本次推送")
+                    await asyncio.sleep(self.config.get('scan_interval', 60))
+                    continue
+                
                 # 执行扫描和下载（_scan_and_download 是异步生成器，需要用 async for 消费）
                 async for _ in self._scan_and_download():
                     pass

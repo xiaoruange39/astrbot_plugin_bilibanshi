@@ -47,5 +47,17 @@
         "type": "list",
         "default": [],
         "hint": "这些群不会收到定时搬石的视频推送"
+    },
+    "quiet_hours_start": {
+        "description": "免打扰开始时间",
+        "type": "string",
+        "default": "",
+        "hint": "格式 HH:MM，如 23:00。留空表示不启用免打扰。在此时段内定时任务不会推送视频"
+    },
+    "quiet_hours_end": {
+        "description": "免打扰结束时间",
+        "type": "string",
+        "default": "",
+        "hint": "格式 HH:MM，如 08:00。支持跨午夜，如开始23:00结束08:00表示晚11点到早8点不推送"
     }
 }
